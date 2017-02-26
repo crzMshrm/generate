@@ -7,17 +7,26 @@ import (
 
 // Schema represents JSON schema.
 type Schema struct {
-	SchemaType  string `json:"$schema"`
-	Title       string `json:"title"`
-	ID          string `json:"id"`
-	Type        string `json:"type"`
-	Description string `json:"description"`
-	Definitions map[string]*Schema
-	Properties  map[string]*Schema
-	Reference   string `json:"$ref"`
-	// Items represents the types that are permitted in the array.
-	Items    *Schema  `json:"items"`
-	Required []string `json:"required"`
+	SchemaType       string `json:"$schema"`
+	Title            string `json:"title"`
+	ID               string `json:"id"`
+	Type             string `json:"type"`
+	Description      string `json:"description"`
+	Definitions      map[string]*Schema
+	Properties       map[string]*Schema
+	Required         []string `json:"required"`
+	Reference        string   `json:"$ref"`
+	Items            *Schema  `json:"items"`
+	MinItems         int      `json:"minItems"`
+	MaxItems         int      `json:"maxItems"`
+	Pattern          string   `json:"pattern"`
+	MinLength        int      `json:"minLength"`
+	MaxLength        int      `json:"maxLength"`
+	MultipleOf       float64  `json:"multipleOf"`
+	Minimum          *float64 `json:"minimum"`
+	ExclusiveMinimum bool     `json:"exclusiveMinimum"`
+	Maximum          *float64 `json:"maximum"`
+	ExclusiveMaximum bool     `json:"exclusiveMaximum"`
 }
 
 // Parse parses a JSON schema from a string.
@@ -34,6 +43,14 @@ func Parse(schema string) (*Schema, error) {
 	}
 
 	return s, err
+}
+
+func ParseMust(schema string) *Schema {
+	sch, err := Parse(schema)
+	if err != nil {
+		panic(err)
+	}
+	return sch
 }
 
 // ExtractTypes creates a map of defined types within the schema.

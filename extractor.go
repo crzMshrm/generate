@@ -8,34 +8,36 @@ import (
 
 	"errors"
 
-	"github.com/a-h/generate/jsonschema"
+	"github.com/crzmshrm/typextract/jsonschema"
 )
 
-// Generator will produce structs from the JSON schema.
-type Generator struct {
+// Extractor will produce meta types from the JSON schema.
+type Extractor struct {
 	schema *jsonschema.Schema
 }
 
-// New creates an instance of a generator which will produce structs.
-func New(schema *jsonschema.Schema) *Generator {
-	return &Generator{
+// New creates an instance of a Extractor which will produce meta types.
+func New(schema *jsonschema.Schema) *Extractor {
+	return &Extractor{
 		schema: schema,
 	}
 }
 
-// CreateStructs creates structs from the JSON schema, keyed by the golang name.
-func (g *Generator) CreateStructs() (structs map[string]Struct, err error) {
-	structs = make(map[string]Struct)
+// CreateStructs creates meta types from the JSON schema, keyed by the golang name.
+func (g *Extractor) CreateStructs() (map[string]StructMeta, []SliceMeta, error) {
+	var slices []SliceMeta
 
 	// Extract nested and complex types from the JSON schema.
 	types := g.schema.ExtractTypes()
+	structs := make(map[string]StructMeta, len(types))
 
 	errs := []error{}
 
 	for _, typeKey := range getOrderedKeyNamesFromSchemaMap(types) {
 		v := types[typeKey]
 
-		fields, err := getFields(typeKey, v.Properties, types, v.Required)
+		fields, _slices, err := getFields(typeKey, v.Properties, types, v.Required)
+		slices = append(slices, _slices...)
 
 		if err != nil {
 			errs = append(errs, err)
@@ -47,7 +49,7 @@ func (g *Generator) CreateStructs() (structs map[string]Struct, err error) {
 			errs = append(errs, err)
 		}
 
-		s := Struct{
+		s := StructMeta{
 			ID:     typeKey,
 			Name:   structName,
 			Fields: fields,
@@ -57,10 +59,10 @@ func (g *Generator) CreateStructs() (structs map[string]Struct, err error) {
 	}
 
 	if len(errs) > 0 {
-		return structs, errors.New(joinErrors(errs))
+		return structs, slices, errors.New(joinErrors(errs))
 	}
 
-	return structs, nil
+	return structs, slices, nil
 }
 
 func joinErrors(errs []error) string {
@@ -88,8 +90,9 @@ func getOrderedKeyNamesFromSchemaMap(m map[string]*jsonschema.Schema) []string {
 	return keys
 }
 
-func getFields(parentTypeKey string, properties map[string]*jsonschema.Schema, types map[string]*jsonschema.Schema, requiredFields []string) (field map[string]Field, err error) {
-	fields := map[string]Field{}
+func getFields(parentTypeKey string, properties map[string]*jsonschema.Schema, types map[string]*jsonschema.Schema, requiredFields []string) (map[string]FieldMeta, []SliceMeta, error) {
+	fields := map[string]FieldMeta{}
+	var slices []SliceMeta
 
 	missingTypes := []string{}
 	errors := []error{}
@@ -98,29 +101,27 @@ func getFields(parentTypeKey string, properties map[string]*jsonschema.Schema, t
 		v := properties[fieldName]
 
 		golangName := getGolangName(fieldName)
-		tn, err := getTypeForField(parentTypeKey, fieldName, golangName, v, types, true)
+		meta, err := getTypeForField(parentTypeKey, fieldName, golangName, v, types, true)
 
 		if err != nil {
 			missingTypes = append(missingTypes, golangName)
 			errors = append(errors, err)
 		}
+		meta.JSONName = fieldName
+		meta.Name = golangName
+		meta.Required = contains(requiredFields, fieldName)
 
-		f := Field{
-			Name:     golangName,
-			JSONName: fieldName,
-			// Look up the types, try references first, then drop to the built-in types.
-			Type:     tn,
-			Required: contains(requiredFields, fieldName),
+		fields[meta.Name] = meta
+		if meta.Slice != nil {
+			slices = append(slices, *meta.Slice)
 		}
-
-		fields[f.Name] = f
 	}
 
 	if len(missingTypes) > 0 {
-		return fields, fmt.Errorf("missing types for %s with errors %s", strings.Join(missingTypes, ","), joinErrors(errors))
+		return fields, slices, fmt.Errorf("missing types for %s with errors %s", strings.Join(missingTypes, ","), joinErrors(errors))
 	}
 
-	return fields, nil
+	return fields, slices, nil
 }
 
 func contains(s []string, e string) bool {
@@ -132,14 +133,14 @@ func contains(s []string, e string) bool {
 	return false
 }
 
-func getTypeForField(parentTypeKey string, fieldName string, fieldGoName string, fieldSchema *jsonschema.Schema, types map[string]*jsonschema.Schema, pointer bool) (typeName string, err error) {
-	majorType := fieldSchema.Type
+func getTypeForField(parentTypeKey string, fieldName string, fieldGoName string, schema *jsonschema.Schema, types map[string]*jsonschema.Schema, pointer bool) (meta FieldMeta, err error) {
+	majorType := schema.Type
 	subType := ""
 
 	// Look up by named reference.
-	if fieldSchema.Reference != "" {
-		if t, ok := types[fieldSchema.Reference]; ok {
-			sn := getStructName(fieldSchema.Reference, t, 1)
+	if schema.Reference != "" {
+		if t, ok := types[schema.Reference]; ok {
+			sn := getStructName(schema.Reference, t, 1)
 
 			majorType = "object"
 			subType = sn
@@ -158,19 +159,40 @@ func getTypeForField(parentTypeKey string, fieldName string, fieldGoName string,
 
 	// Find named array references.
 	if majorType == "array" {
-		s, _ := getTypeForField(parentTypeKey, fieldName, fieldGoName, fieldSchema.Items, types, false)
-		subType = s
+		s, _ := getTypeForField(parentTypeKey, fieldName, fieldGoName, schema.Items, types, false)
+		meta.Slice = &SliceMeta{s.Type, schema.MinItems, schema.MaxItems}
+
+		subType = s.Type
 	}
 
-	name, err := getPrimitiveTypeName(majorType, subType, pointer)
+	typName, err := getPrimitiveTypeName(majorType, subType, pointer)
+
+	switch typName {
+	case "int", "float64":
+		if schema.MultipleOf != 0 ||
+			schema.Minimum != nil ||
+			schema.ExclusiveMinimum ||
+			schema.Maximum != nil ||
+			schema.ExclusiveMaximum {
+			meta.Number = &NumberMeta{schema.MultipleOf, schema.Minimum, schema.ExclusiveMinimum, schema.Maximum, schema.ExclusiveMaximum}
+		}
+	case "string":
+		if schema.MinLength != 0 ||
+			schema.MaxLength != 0 ||
+			schema.Pattern != "" {
+			meta.String = &StringMeta{schema.MinLength, schema.MaxLength, schema.Pattern}
+		}
+	}
 
 	if err != nil {
-		return name, fmt.Errorf("Failed to get the type for %s with error %s",
+		return meta, fmt.Errorf("Failed to get the type for %s with error %s",
 			fieldGoName,
 			err.Error())
 	}
 
-	return name, nil
+	meta.Type = typName
+
+	return
 }
 
 func getPrimitiveTypeName(schemaType string, subType string, pointer bool) (name string, err error) {
@@ -286,17 +308,17 @@ func capitaliseFirstLetter(s string) string {
 	return strings.ToUpper(prefix) + suffix
 }
 
-// Struct defines the data required to generate a struct in Go.
-type Struct struct {
+// StructMeta defines the data required to generate a struct in Go.
+type StructMeta struct {
 	// The ID within the JSON schema, e.g. #/definitions/address
 	ID string
 	// The golang name, e.g. "Address"
 	Name   string
-	Fields map[string]Field
+	Fields map[string]FieldMeta
 }
 
-// Field defines the data required to generate a field in Go.
-type Field struct {
+// FieldMeta defines the data required to generate a field in Go.
+type FieldMeta struct {
 	// The golang name, e.g. "Address1"
 	Name string
 	// The JSON name, e.g. "address1"
@@ -305,4 +327,27 @@ type Field struct {
 	Type string
 	// Required is set to true when the field is required.
 	Required bool
+	Slice    *SliceMeta
+	String   *StringMeta
+	Number   *NumberMeta
+}
+
+type SliceMeta struct {
+	ElemType string
+	MinItems int
+	MaxItems int
+}
+
+type StringMeta struct {
+	MinLength int
+	MaxLength int
+	Pattern   string
+}
+
+type NumberMeta struct {
+	MultipleOf       float64
+	Minimum          *float64
+	ExclusiveMinimum bool
+	Maximum          *float64
+	ExclusiveMaximum bool
 }
